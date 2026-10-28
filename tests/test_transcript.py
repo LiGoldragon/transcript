@@ -37,9 +37,27 @@ class InputClassificationTests(unittest.TestCase):
         self.assertEqual(result.status, "machine")
 
     def test_datom_shape_is_typed_uncertainty(self):
-        result = classify_input(claude("Lock.{ name [ /tmp/file ] }"))
+        for text in ("Lock.{ name [ /tmp/file ] }", "Observed.Locks.[]", "Err.«no such lock»"):
+            result = classify_input(claude(text))
+            self.assertEqual(result.status, "ambiguous")
+            self.assertEqual(result.reason, "whole_datom")
+
+    def test_sender_signature_is_machine(self):
+        result = classify_input(claude("From Mind flow Primary bb30ec, a machine:\nhello"))
+        self.assertEqual(result.status, "machine")
+
+    def test_abbreviation_and_code_are_living_prose(self):
+        for text in ("Dr. Smith is here", "Use Foo.{x} in the example", "code = { braces }"):
+            self.assertEqual(classify_input(claude(text)).status, "living")
+
+    def test_mixed_blocks_are_ambiguous(self):
+        record = claude([
+            {"type": "text", "text": "human prose"},
+            {"type": "text", "text": "<system-reminder>machine text</system-reminder>"},
+        ])
+        result = classify_input(record)
         self.assertEqual(result.status, "ambiguous")
-        self.assertEqual(result.reason, "datom_shape_without_authorship")
+        self.assertEqual(result.reason, "mixed_unseparable_provenance")
 
     def test_meta_user_record_is_machine(self):
         result = classify_input(claude("generated", isMeta=True))

@@ -80,8 +80,13 @@ MACHINE_MARKERS = (
     "<task-notification>",
     "<environment_context>",
 )
-RELAY_MARKER = re.compile(r"(?im)^(?:Soft|MiddleAbrupt|HardAbrupt)\.")
-DATOM_HEAD = re.compile(r"^\s*[A-Z][A-Za-z0-9_-]*\.")
+RELAY_MARKER = re.compile(
+    r"(?im)^(?:Soft|MiddleAbrupt|HardAbrupt)\."
+    r"|^\s*From\s+(?:Psyche|Mind|Field)\s+"
+    r"(?:\S+\s+(?:Primary|Secondary|Tertiary|Quaternary)\b|"
+    r"flow\s+(?:Primary|Secondary|Tertiary|Quaternary)\b\s+\S+)"
+    r"|\b(?:FLOW_ID|Flow ID)\s*[:=]"
+)
 
 
 def _record_text(record):
@@ -113,6 +118,51 @@ def _record_text(record):
     return ""
 
 
+def _is_whole_datom(text):
+    """Recognize structured datom text without mistaking ``Dr. Smith`` for it.
+
+    This is deliberately a bounded recognizer, not a replacement for the
+    production datom parser. It accepts a capitalized head/variant chain that
+    ends in a balanced ``{}``, ``[]``, ``()``, or ``«»`` form, with nested
+    delimiters and quoted content; ordinary prose and code remain untouched.
+    """
+    text = text.strip()
+    if not text or not re.match(r"^[A-Z][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)*\.", text):
+        return False
+    openers = {"{": "}", "[": "]", "(": ")", "«": "»"}
+    closers = set(openers.values())
+    stack = []
+    in_quote = False
+    i = text.find(".")
+    while i < len(text):
+        char = text[i]
+        if char == "«":
+            if not stack or in_quote:
+                in_quote = True
+            else:
+                stack.append("»")
+        elif char == "»" and in_quote:
+            in_quote = False
+        elif not in_quote and char in openers:
+            stack.append(openers[char])
+        elif not in_quote and char in closers:
+            if not stack or stack.pop() != char:
+                return False
+        i += 1
+    return bool(stack == [] and not in_quote and any(c in text for c in openers))
+
+
+def _has_mixed_text_blocks(record):
+    """Whether a record has separately stored text blocks we cannot attribute."""
+    msg = record.get("message", {})
+    content = msg.get("content")
+    if not isinstance(content, list):
+        payload = record.get("payload", {})
+        item = payload.get("item", {}) if isinstance(payload, dict) else {}
+        content = item.get("content") if isinstance(item, dict) else None
+    return isinstance(content, list) and len(content) > 1
+
+
 def classify_input(record):
     """Classify an authenticated Claude/Codex input without guessing authorship."""
     rtype = record.get("type", "")
@@ -139,9 +189,11 @@ def classify_input(record):
 
     text = _record_text(record)
     if any(marker in text for marker in MACHINE_MARKERS) or RELAY_MARKER.search(text):
+        if _has_mixed_text_blocks(record):
+            return InputClassification("ambiguous", text, source, "mixed_unseparable_provenance")
         return InputClassification("machine", text, source, "explicit_machine_marker")
-    if DATOM_HEAD.match(text):
-        return InputClassification("ambiguous", text, source, "datom_shape_without_authorship")
+    if _is_whole_datom(text):
+        return InputClassification("ambiguous", text, source, "whole_datom")
     return InputClassification("living", text, source, "authenticated_input_stream")
 
 
