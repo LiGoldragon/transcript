@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -57,11 +58,99 @@ def parse_record(line_text):
         return None
 
 
+@dataclass(frozen=True)
+class InputClassification:
+    """The provenance decision for one possible input turn.
+
+    ``ambiguous`` is intentional: datom-shaped text does not prove who
+    authored it, so callers must not silently turn it into a living quote.
+    """
+
+    status: str  # living, machine, ambiguous, or not_input
+    text: str
+    source: str
+    reason: str
+
+
+MACHINE_MARKERS = (
+    "<local-command-caveat>",
+    "<local-command-stdout>",
+    "<command-name>",
+    "<system-reminder>",
+    "<task-notification>",
+    "<environment_context>",
+)
+RELAY_MARKER = re.compile(r"(?im)^(?:Soft|MiddleAbrupt|HardAbrupt)\.")
+DATOM_HEAD = re.compile(r"^\s*[A-Z][A-Za-z0-9_-]*\.")
+
+
+def _record_text(record):
+    """Return text from Claude or Codex message content."""
+    msg = record.get("message", {})
+    content = msg.get("content", [])
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text = "\n".join(
+            item.get("text", "")
+            for item in content
+            if isinstance(item, dict)
+            and item.get("type") in ("text", "input_text", "output_text")
+        )
+        if text:
+            return text
+    payload = record.get("payload", {})
+    item = payload.get("item", {}) if isinstance(payload, dict) else {}
+    content = item.get("content", []) if isinstance(item, dict) else []
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") in ("text", "input_text")
+        )
+    return ""
+
+
+def classify_input(record):
+    """Classify an authenticated Claude/Codex input without guessing authorship."""
+    rtype = record.get("type", "")
+    source = ""
+    if rtype == "user" and record.get("message", {}).get("role") == "user":
+        # Claude records identify the user stream with userType. Meta entries
+        # are harness-generated even though they carry the user role.
+        if record.get("isMeta") is True:
+            return InputClassification("machine", _record_text(record), "claude", "meta")
+        user_type = record.get("userType")
+        if user_type not in ("external", "human"):
+            status = "ambiguous" if user_type is None else "machine"
+            reason = "missing_authentication" if user_type is None else "user_type"
+            return InputClassification(status, _record_text(record), "claude", reason)
+        source = "claude_user"
+    elif (
+        rtype == "event_msg"
+        and record.get("payload", {}).get("type") == "item_completed"
+        and record.get("payload", {}).get("item", {}).get("type") == "UserMessage"
+    ):
+        source = "codex_user_message"
+    else:
+        return InputClassification("not_input", "", "", "record_shape")
+
+    text = _record_text(record)
+    if any(marker in text for marker in MACHINE_MARKERS) or RELAY_MARKER.search(text):
+        return InputClassification("machine", text, source, "explicit_machine_marker")
+    if DATOM_HEAD.match(text):
+        return InputClassification("ambiguous", text, source, "datom_shape_without_authorship")
+    return InputClassification("living", text, source, "authenticated_input_stream")
+
+
 def extract_text(record):
     """Extract text content from a message record.
 
     Returns (role, text, is_human_origin, origin_kind, timestamp).
     """
+    classification = classify_input(record)
     msg = record.get("message", {})
     role = msg.get("role", "")
     content = msg.get("content", [])
@@ -77,7 +166,9 @@ def extract_text(record):
             if isinstance(item, dict) and item.get("type") == "text":
                 texts.append(item.get("text", ""))
 
-    return role, "\n".join(texts), origin_kind == "human", origin_kind, timestamp
+    if classification.source == "codex_user_message":
+        return "user", classification.text, classification.status == "living", classification.status, timestamp
+    return role, "\n".join(texts), classification.status == "living", classification.status, timestamp
 
 
 def trim_text(text, cap):
@@ -155,9 +246,8 @@ def cmd_show(args):
             role, text, _, _, ts = extract_text(rec)
             if text.strip():
                 assistant_texts.append((line_no, ts, text))
-        elif rtype == "user":
-            origin = rec.get("origin", {})
-            if origin.get("kind") == "human":
+        elif rtype in ("user", "event_msg"):
+            if classify_input(rec).status == "living":
                 role, text, _, _, ts = extract_text(rec)
                 # Find the last N assistant text responses before this line
                 ctx_start = max(0, len(assistant_texts) - context_n)
@@ -211,9 +301,8 @@ def cmd_search(args):
             rtype = rec.get("type", "")
 
             # Filter to human-origin user messages (and optionally assistant text)
-            if rtype == "user":
-                origin = rec.get("origin", {})
-                if origin.get("kind") != "human":
+            if rtype in ("user", "event_msg"):
+                if classify_input(rec).status != "living":
                     continue
             elif rtype == "assistant" and also_assistant:
                 pass
